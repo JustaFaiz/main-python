@@ -1,0 +1,8 @@
+import openpyxl
+
+wb1 = openpyxl.load_workbook(r'file1.xlsx', data_only=True)
+ws1 = wb1['Sheet1']
+
+for cell in ws1[1]:
+    if cell.value:
+        print(repr(cell.value))
