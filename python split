@@ -1,0 +1,23 @@
+import re
+
+def extract_key_from_symbol(value):
+    """From 'ACCOUNTS - Symbol Name' column e.g. 'US 1100010J' -> 'US1100010'"""
+    if value is None:
+        return None
+    cleaned = str(value).replace(' ', '')          # remove stray spaces
+    match = re.match(r'^(US\d+)', cleaned)          # grab US + leading digits
+    return match.group(1) if match else None
+
+def extract_key_from_accounts(value):
+    """From 'ACCOUNTS' column e.g. 'US0110010 - LVL4 US.0.1100.10 ...' -> 'US0110010'"""
+    if value is None:
+        return None
+    return str(value).split(' - ')[0].strip()
+
+# quick test
+tests_symbol = ['USTIT', 'US1T', 'US673020T', 'US 1100010J']
+tests_accounts = ['US0110010 - LVL4 US.0.1100.10 F- 832E11 Intercompany Dividend 100% DRD',
+                   'US0110030 - LVL4 US.0.1100.30 F- 832E17 Intercompany Dividend 70% DRD']
+
+print([extract_key_from_symbol(v) for v in tests_symbol])
+print([extract_key_from_accounts(v) for v in tests_accounts])
