@@ -1,0 +1,57 @@
+import openpyxl
+
+# ---- CONFIG: edit these ----
+FILE1 = 'file1.xlsx'
+FILE2 = 'file2.xlsx'
+SHEET1 = 'Sheet1'
+SHEET2 = 'Sheet1'
+
+KEY_HEADER = 'Account ID'          # must exist in both files, same name
+
+# Columns to pull FROM FILE1 (besides the key)
+COLS_FROM_1 = ['Amount', 'Cost Center']
+
+# Columns to pull FROM FILE2 (besides the key)
+COLS_FROM_2 = ['Tax Code', 'Entity', 'GL Account']
+
+OUTPUT_FILE = 'mapped_output.xlsx'
+# ---- END CONFIG ----
+
+wb1 = openpyxl.load_workbook(FILE1, data_only=True)
+wb2 = openpyxl.load_workbook(FILE2, data_only=True)
+ws1 = wb1[SHEET1]
+ws2 = wb2[SHEET2]
+
+def header_map(ws):
+    return {cell.value: cell.column for cell in ws[1] if cell.value is not None}
+
+h1 = header_map(ws1)
+h2 = header_map(ws2)
+
+def index_by_key(ws, headers, key_header, cols):
+    data = {}
+    for row in range(2, ws.max_row + 1):
+        key = ws.cell(row=row, column=headers[key_header]).value
+        if key is None:
+            continue
+        data[key] = [ws.cell(row=row, column=headers[c]).value for c in cols]
+    return data
+
+data1 = index_by_key(ws1, h1, KEY_HEADER, COLS_FROM_1)
+data2 = index_by_key(ws2, h2, KEY_HEADER, COLS_FROM_2)
+
+all_keys = sorted(set(data1) | set(data2), key=str)
+
+wb3 = openpyxl.Workbook()
+ws3 = wb3.active
+ws3.title = 'Mapped'
+ws3.append([KEY_HEADER] + COLS_FROM_1 + COLS_FROM_2)
+
+for key in all_keys:
+    row = [key]
+    row += data1.get(key, [None] * len(COLS_FROM_1))
+    row += data2.get(key, [None] * len(COLS_FROM_2))
+    ws3.append(row)
+
+wb3.save(OUTPUT_FILE)
+print(f"Done. {len(all_keys)} rows written to {OUTPUT_FILE}")
