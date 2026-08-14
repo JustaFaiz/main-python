@@ -1,0 +1,135 @@
+import re
+import openpyxl
+
+# ==================== CONFIG — edit this section ====================
+
+FILE1 = r'file1.xlsx'      # file containing "ACCOUNTS - Symbol Name" column
+SHEET1 = 'Sheet1'
+HEADER_ROW_1 = 3            # row number where actual column headers are in FILE1
+
+FILE2 = r'file2.xlsx'      # file containing "TIMEPER=" column
+SHEET2 = 'Sheet1'
+HEADER_ROW_2 = 3            # all headers in this file are on row 3
+
+KEY_HEADER_1 = 'Column1'                  # header in FILE1 - already a clean key, no extraction needed
+KEY_HEADER_2 = 'ACCOUNTS'                 # header in FILE2, row 3
+
+# Extra columns to pull FROM FILE1 (besides the key)
+COLS_FROM_1 = ['Amount', 'Cost Center']
+
+# Extra columns to pull FROM FILE2 (besides the key)
+COLS_FROM_2 = ['Tax Code', 'Entity', 'GL Account']
+
+OUTPUT_FILE = r'mapped_output.xlsx'
+
+# ==================== END CONFIG ====================
+
+
+def header_map(ws, header_row=1):
+    """Map header text (stripped) -> column index, reading the given header row."""
+    result = {}
+    for cell in ws[header_row]:
+        if cell.value is not None:
+            clean = str(cell.value).replace('\xa0', ' ').strip()
+            clean = re.sub(r'\s+', ' ', clean)
+            result[clean] = cell.column
+    return result
+
+
+def extract_key_identity(value):
+    """For columns that are already a clean key (e.g. File1's 'Column1') - just strip whitespace."""
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    return cleaned if cleaned else None
+
+
+def extract_key_from_symbol(value):
+    """'ACCOUNTS - Symbol Name' e.g. 'US 1100010J' -> 'US1100010'. Returns None if no digits found."""
+    if value is None:
+        return None
+    cleaned = str(value).replace(' ', '')
+    match = re.match(r'^(US\d+)', cleaned)
+    return match.group(1) if match else None
+
+
+def extract_key_from_accounts(value):
+    """'ACCOUNTS' e.g. 'US0110010 - LVL4 US.0.1100.10 ...' -> 'US0110010'."""
+    if value is None:
+        return None
+    return str(value).split(' - ')[0].strip()
+
+
+def index_by_key(ws, headers, key_header, cols, key_extractor, header_row=1):
+    """Returns (data_dict keyed by extracted key, list of raw values that failed to extract)."""
+    data = {}
+    unmatched_raw = []
+    key_col = headers[key_header]
+    for row in range(header_row + 1, ws.max_row + 1):
+        raw_val = ws.cell(row=row, column=key_col).value
+        if raw_val is None:
+            continue
+        key = key_extractor(raw_val)
+        if key is None:
+            unmatched_raw.append(raw_val)
+            continue
+        data[key] = {
+            'raw': raw_val,
+            'values': [ws.cell(row=row, column=headers[c]).value for c in cols]
+        }
+    return data, unmatched_raw
+
+
+def main():
+    wb1 = openpyxl.load_workbook(FILE1, data_only=True)
+    wb2 = openpyxl.load_workbook(FILE2, data_only=True)
+    ws1 = wb1[SHEET1]
+    ws2 = wb2[SHEET2]
+
+    h1 = header_map(ws1, HEADER_ROW_1)
+    h2 = header_map(ws2, HEADER_ROW_2)
+
+    data1, unmatched_extract_1 = index_by_key(ws1, h1, KEY_HEADER_1, COLS_FROM_1, extract_key_identity, HEADER_ROW_1)
+    data2, unmatched_extract_2 = index_by_key(ws2, h2, KEY_HEADER_2, COLS_FROM_2, extract_key_from_accounts, HEADER_ROW_2)
+
+    keys1 = set(data1)
+    keys2 = set(data2)
+    matched_keys = sorted(keys1 & keys2)
+    only_in_1 = sorted(keys1 - keys2)
+    only_in_2 = sorted(keys2 - keys1)
+
+    wb_out = openpyxl.Workbook()
+
+    # --- Main mapped sheet (only fully matched rows) ---
+    ws_out = wb_out.active
+    ws_out.title = 'Mapped'
+    ws_out.append(['Key'] + COLS_FROM_1 + COLS_FROM_2)
+    for key in matched_keys:
+        row = [key] + data1[key]['values'] + data2[key]['values']
+        ws_out.append(row)
+
+    # --- Unmatched sheet ---
+    ws_unmatched = wb_out.create_sheet('Unmatched')
+    ws_unmatched.append(['Reason', 'Source File', 'Raw Value', 'Extracted Key'])
+
+    for key in only_in_1:
+        ws_unmatched.append(['No match in File2', 'File1', data1[key]['raw'], key])
+    for key in only_in_2:
+        ws_unmatched.append(['No match in File1', 'File2', data2[key]['raw'], key])
+    for raw_val in unmatched_extract_1:
+        ws_unmatched.append(['Could not extract key', 'File1', raw_val, None])
+    for raw_val in unmatched_extract_2:
+        ws_unmatched.append(['Could not extract key', 'File2', raw_val, None])
+
+    wb_out.save(OUTPUT_FILE)
+
+    print(f"Matched rows: {len(matched_keys)}")
+    print(f"Only in File1 (no match): {len(only_in_1)}")
+    print(f"Only in File2 (no match): {len(only_in_2)}")
+    print(f"File1 rows with unextractable key: {len(unmatched_extract_1)}")
+    print(f"File2 rows with unextractable key: {len(unmatched_extract_2)}")
+    print(f"Saved to {OUTPUT_FILE}")
+
+
+if __name__ == '__main__':
+    main()
