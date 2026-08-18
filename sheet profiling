@@ -1,0 +1,259 @@
+"""
+Column Profiler & Cross-Sheet Key Finder
+==========================================
+Reads one or more Excel files (any number of sheets each), profiles every
+column (data type, uniqueness %, null %, distinct count), then compares
+every column against every other column ACROSS files/sheets to find which
+pairs of columns likely represent the same key (high value overlap).
+
+Outputs a single Excel report:
+  - 'Column Profile' : stats for every column found
+  - 'Top Matches'     : best candidate match(es) for each usable column
+  - 'Candidate Keys'  : ranked shortlist of the strongest key-pair candidates
+
+No manual header-row guessing needed - header row is auto-detected per sheet.
+"""
+
+import re
+import openpyxl
+from openpyxl.utils import get_column_letter
+from itertools import combinations
+
+# ==================== CONFIG ====================
+
+# List every file you want profiled. sheets=None means "profile all sheets in this file".
+FILES = [
+    {'path': r'file1.xlsx', 'sheets': None},
+    {'path': r'file2.xlsx', 'sheets': None},
+    # {'path': r'file3.xlsx', 'sheets': ['TCOA_Mapping', 'GL_Detail']},
+]
+
+HEADER_SCAN_ROWS = 15          # how many top rows to scan when auto-detecting the header row
+MIN_NON_NULL_TO_CONSIDER = 5   # skip columns with fewer than this many non-null values
+MIN_UNIQUENESS_TO_CONSIDER = 0.3   # skip columns with uniqueness below this (too repetitive to be a key)
+MIN_OVERLAP_TO_REPORT = 0.15   # only report column-pair matches at/above this overlap coefficient
+TOP_MATCHES_PER_COLUMN = 3     # how many best matches to list per column
+INCLUDE_SAME_FILE_PAIRS = False  # compare columns within the same file/sheet too, or only across files
+
+OUTPUT_FILE = r'profiling_report.xlsx'
+
+# ==================== END CONFIG ====================
+
+
+def normalize(value):
+    """Normalize a cell value into a comparable string for overlap purposes."""
+    if value is None:
+        return None
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    s = str(value).strip().upper()
+    s = re.sub(r'\s+', ' ', s)
+    return s if s else None
+
+
+def auto_detect_header_row(rows, scan_limit):
+    """Pick the row (0-based index into `rows`) with the most non-null cells
+    within the first `scan_limit` rows - a simple but effective heuristic
+    for skipping title rows / blank rows above the real header."""
+    best_idx = 0
+    best_count = -1
+    limit = min(scan_limit, len(rows))
+    for i in range(limit):
+        non_null = sum(1 for v in rows[i] if v is not None and str(v).strip() != '')
+        if non_null > best_count:
+            best_count = non_null
+            best_idx = i
+    return best_idx
+
+
+def infer_dtype(values):
+    non_null = [v for v in values if v is not None and v != '']
+    if not non_null:
+        return 'empty'
+    numeric = sum(1 for v in non_null if isinstance(v, (int, float)))
+    if numeric == len(non_null):
+        return 'numeric'
+    elif numeric == 0:
+        return 'text'
+    return 'mixed'
+
+
+def load_tables(files_config):
+    """Returns a list of table dicts: {file, sheet, header_row, columns: [colname,...],
+    column_values: {colname: [raw values]}}"""
+    tables = []
+    for fconf in files_config:
+        path = fconf['path']
+        wanted_sheets = fconf.get('sheets')
+        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+        sheet_names = wanted_sheets if wanted_sheets else wb.sheetnames
+        for sheet_name in sheet_names:
+            if sheet_name not in wb.sheetnames:
+                print(f"WARNING: sheet '{sheet_name}' not found in {path}, skipping.")
+                continue
+            ws = wb[sheet_name]
+            rows = [row for row in ws.iter_rows(values_only=True)]
+            if not rows:
+                continue
+            header_idx = auto_detect_header_row(rows, HEADER_SCAN_ROWS)
+            header_row_vals = rows[header_idx]
+            data_rows = rows[header_idx + 1:]
+
+            colnames = []
+            seen = {}
+            for i, h in enumerate(header_row_vals):
+                name = str(h).strip() if h is not None and str(h).strip() != '' else f'Col{i+1}'
+                if name in seen:
+                    seen[name] += 1
+                    name = f"{name}_{seen[name]}"
+                else:
+                    seen[name] = 1
+                colnames.append(name)
+
+            column_values = {name: [] for name in colnames}
+            for row in data_rows:
+                for i, name in enumerate(colnames):
+                    val = row[i] if i < len(row) else None
+                    column_values[name].append(val)
+
+            tables.append({
+                'file': path,
+                'sheet': sheet_name,
+                'header_row_excel': header_idx + 1,   # 1-based, matches what user sees in Excel
+                'columns': colnames,
+                'column_values': column_values,
+            })
+        wb.close()
+    return tables
+
+
+def profile_column(name, values):
+    non_null = [v for v in values if v is not None and v != '']
+    count = len(values)
+    non_null_count = len(non_null)
+    null_pct = 1 - (non_null_count / count) if count else 1.0
+    norm_set = set(filter(None, (normalize(v) for v in non_null)))
+    distinct_count = len(norm_set)
+    uniqueness_pct = (distinct_count / non_null_count) if non_null_count else 0.0
+    dtype = infer_dtype(non_null)
+    samples = list(norm_set)[:5]
+    return {
+        'name': name,
+        'count': count,
+        'non_null_count': non_null_count,
+        'null_pct': null_pct,
+        'distinct_count': distinct_count,
+        'uniqueness_pct': uniqueness_pct,
+        'dtype': dtype,
+        'samples': samples,
+        'value_set': norm_set,
+    }
+
+
+def overlap_coefficient(set_a, set_b):
+    if not set_a or not set_b:
+        return 0.0
+    inter = len(set_a & set_b)
+    return inter / min(len(set_a), len(set_b))
+
+
+def jaccard(set_a, set_b):
+    if not set_a and not set_b:
+        return 0.0
+    union = len(set_a | set_b)
+    if union == 0:
+        return 0.0
+    return len(set_a & set_b) / union
+
+
+def main():
+    print("Loading and profiling tables...")
+    tables = load_tables(FILES)
+
+    all_columns = []  # list of dicts: profile + table ref
+    for t in tables:
+        for colname in t['columns']:
+            prof = profile_column(colname, t['column_values'][colname])
+            prof['file'] = t['file']
+            prof['sheet'] = t['sheet']
+            prof['header_row_excel'] = t['header_row_excel']
+            all_columns.append(prof)
+
+    print(f"Profiled {len(all_columns)} columns across {len(tables)} sheet(s).")
+
+    # Only compare columns that look "key-like"
+    candidates = [c for c in all_columns
+                  if c['non_null_count'] >= MIN_NON_NULL_TO_CONSIDER
+                  and c['uniqueness_pct'] >= MIN_UNIQUENESS_TO_CONSIDER]
+
+    print(f"{len(candidates)} columns qualify as key candidates for overlap comparison.")
+
+    matches = []  # list of (col_a, col_b, jaccard, overlap_coeff)
+    for a, b in combinations(candidates, 2):
+        if not INCLUDE_SAME_FILE_PAIRS and a['file'] == b['file'] and a['sheet'] == b['sheet']:
+            continue
+        oc = overlap_coefficient(a['value_set'], b['value_set'])
+        if oc < MIN_OVERLAP_TO_REPORT:
+            continue
+        jc = jaccard(a['value_set'], b['value_set'])
+        matches.append((a, b, jc, oc))
+
+    matches.sort(key=lambda m: m[3], reverse=True)
+    print(f"Found {len(matches)} candidate column-pair matches above threshold.")
+
+    # Build output workbook
+    wb_out = openpyxl.Workbook()
+
+    # --- Column Profile sheet ---
+    ws_prof = wb_out.active
+    ws_prof.title = 'Column Profile'
+    ws_prof.append(['File', 'Sheet', 'Header Row', 'Column', 'Data Type',
+                     'Non-Null Count', 'Null %', 'Distinct Count', 'Uniqueness %', 'Sample Values'])
+    for c in all_columns:
+        ws_prof.append([
+            c['file'], c['sheet'], c['header_row_excel'], c['name'], c['dtype'],
+            c['non_null_count'], round(c['null_pct'] * 100, 1),
+            c['distinct_count'], round(c['uniqueness_pct'] * 100, 1),
+            ', '.join(str(s) for s in c['samples'])
+        ])
+    ws_prof.auto_filter.ref = f"A1:J{ws_prof.max_row}"
+
+    # --- Candidate Keys sheet (ranked) ---
+    ws_cand = wb_out.create_sheet('Candidate Keys')
+    ws_cand.append(['Rank', 'File A', 'Sheet A', 'Column A', 'File B', 'Sheet B', 'Column B',
+                     'Overlap %', 'Jaccard %', 'Uniqueness A %', 'Uniqueness B %', 'Composite Score'])
+    scored = []
+    for a, b, jc, oc in matches:
+        composite = oc * a['uniqueness_pct'] * b['uniqueness_pct']
+        scored.append((a, b, jc, oc, composite))
+    scored.sort(key=lambda m: m[4], reverse=True)
+    for i, (a, b, jc, oc, composite) in enumerate(scored, start=1):
+        ws_cand.append([
+            i, a['file'], a['sheet'], a['name'], b['file'], b['sheet'], b['name'],
+            round(oc * 100, 1), round(jc * 100, 1),
+            round(a['uniqueness_pct'] * 100, 1), round(b['uniqueness_pct'] * 100, 1),
+            round(composite, 4)
+        ])
+    ws_cand.auto_filter.ref = f"A1:L{ws_cand.max_row}"
+
+    # --- Top Matches sheet (per-column best matches) ---
+    ws_top = wb_out.create_sheet('Top Matches')
+    ws_top.append(['File', 'Sheet', 'Column', 'Match Rank', 'Matched File', 'Matched Sheet',
+                    'Matched Column', 'Overlap %'])
+    by_column = {}
+    for a, b, jc, oc in matches:
+        by_column.setdefault(id(a), (a, []))[1].append((b, oc))
+        by_column.setdefault(id(b), (b, []))[1].append((a, oc))
+    for col_id, (col, match_list) in by_column.items():
+        match_list.sort(key=lambda x: x[1], reverse=True)
+        for rank, (other, oc) in enumerate(match_list[:TOP_MATCHES_PER_COLUMN], start=1):
+            ws_top.append([col['file'], col['sheet'], col['name'], rank,
+                            other['file'], other['sheet'], other['name'], round(oc * 100, 1)])
+    ws_top.auto_filter.ref = f"A1:H{ws_top.max_row}"
+
+    wb_out.save(OUTPUT_FILE)
+    print(f"Saved report to {OUTPUT_FILE}")
+
+
+if __name__ == '__main__':
+    main()
