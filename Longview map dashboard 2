@@ -1,0 +1,268 @@
+"""
+Excel Key Mapper - Streamlit Dashboard
+========================================
+Interactive UI for the file1/file2 key-mapping workflow: upload two Excel
+files, pick sheets/header rows/columns from dropdowns (no manual config
+editing), preview, then download the mapped output.
+
+Run with:
+    pip install streamlit openpyxl
+    streamlit run mapping_dashboard.py
+"""
+
+import re
+import io
+import openpyxl
+import streamlit as st
+
+st.set_page_config(page_title="Excel Key Mapper", layout="wide")
+
+
+# ==================== CORE LOGIC (same as script version) ====================
+
+def header_map(ws, header_row):
+    result = {}
+    for cell in ws[header_row]:
+        if cell.value is not None:
+            clean = str(cell.value).replace('\xa0', ' ').strip()
+            clean = re.sub(r'\s+', ' ', clean)
+            result[clean] = cell.column
+    return result
+
+
+def extract_identity(value):
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    return cleaned if cleaned else None
+
+
+def extract_split_dash(value):
+    """'US0110010 - LVL4 ...' -> 'US0110010'"""
+    if value is None:
+        return None
+    return str(value).split(' - ')[0].strip()
+
+
+def extract_us_digits(value):
+    """'US 1100010J' -> 'US1100010'"""
+    if value is None:
+        return None
+    cleaned = str(value).replace(' ', '')
+    match = re.match(r'^(US\d+)', cleaned)
+    return match.group(1) if match else None
+
+
+EXTRACTORS = {
+    "As-is (no cleanup)": extract_identity,
+    "Split on ' - ' (take first part)": extract_split_dash,
+    "Extract 'US' + digits (ignore letters/spaces)": extract_us_digits,
+}
+
+
+def index_by_key(ws, headers, key_header, cols, key_extractor, header_row, keep_all_rows):
+    data = {}
+    unmatched_raw = []
+    key_col = headers[key_header]
+    for row in range(header_row + 1, ws.max_row + 1):
+        raw_val = ws.cell(row=row, column=key_col).value
+        if raw_val is None:
+            continue
+        key = key_extractor(raw_val)
+        if key is None:
+            unmatched_raw.append(raw_val)
+            continue
+        entry = {'raw': raw_val, 'values': [ws.cell(row=row, column=headers[c]).value for c in cols]}
+        if keep_all_rows:
+            data.setdefault(key, []).append(entry)
+        else:
+            data[key] = [entry]   # always store as list internally for uniform handling
+    return data, unmatched_raw
+
+
+def negate(value):
+    if value is None:
+        return None
+    try:
+        return -value
+    except TypeError:
+        return None
+
+
+def load_workbook_cached(uploaded_file):
+    return openpyxl.load_workbook(uploaded_file, data_only=True)
+
+
+def get_headers_at_row(ws, row_num):
+    return [str(c.value).strip() for c in ws[row_num] if c.value is not None]
+
+
+# ==================== SESSION STATE HELPERS ====================
+
+def file_config_ui(label, key_prefix):
+    st.subheader(label)
+    uploaded = st.file_uploader(f"Upload {label}", type=['xlsx'], key=f"{key_prefix}_upload")
+    if not uploaded:
+        return None
+
+    wb = load_workbook_cached(uploaded)
+    sheet = st.selectbox("Sheet", wb.sheetnames, key=f"{key_prefix}_sheet")
+    ws = wb[sheet]
+
+    max_preview_row = min(10, ws.max_row)
+    header_row = st.number_input(
+        "Header row number", min_value=1, max_value=max(ws.max_row, 1),
+        value=1, key=f"{key_prefix}_header_row",
+        help="The row containing your actual column names (not a title row)."
+    )
+
+    with st.expander("Preview first 10 rows (to help find the header row)"):
+        preview_rows = []
+        for r in range(1, max_preview_row + 1):
+            preview_rows.append([c.value for c in ws[r]])
+        st.dataframe(preview_rows, use_container_width=True)
+
+    try:
+        headers = get_headers_at_row(ws, header_row)
+    except Exception:
+        headers = []
+
+    if not headers:
+        st.warning("No headers detected at that row. Adjust the header row number above.")
+        return None
+
+    key_header = st.selectbox("Key column (used for matching)", headers, key=f"{key_prefix}_keyheader")
+    extractor_choice = st.selectbox(
+        "Key cleanup method", list(EXTRACTORS.keys()), key=f"{key_prefix}_extractor",
+        help="How to turn the raw key cell into a clean matching key."
+    )
+    extra_cols = st.multiselect(
+        "Extra columns to pull into the output", [h for h in headers if h != key_header],
+        key=f"{key_prefix}_extracols"
+    )
+    keep_all_rows = st.checkbox(
+        "Keep ALL rows that share the same key (don't collapse duplicates)",
+        value=False, key=f"{key_prefix}_keepall"
+    )
+
+    return {
+        'wb': wb, 'ws': ws, 'sheet': sheet, 'header_row': header_row,
+        'key_header': key_header, 'extractor': EXTRACTORS[extractor_choice],
+        'extra_cols': extra_cols, 'keep_all_rows': keep_all_rows,
+    }
+
+
+# ==================== MAIN APP ====================
+
+st.title("Excel Key Mapper")
+st.caption("Upload two Excel files, configure the mapping, download the merged result. No code editing needed.")
+
+col_a, col_b = st.columns(2)
+with col_a:
+    conf1 = file_config_ui("File 1", "f1")
+with col_b:
+    conf2 = file_config_ui("File 2", "f2")
+
+st.divider()
+
+credit_source = None
+display_names = {}
+
+if conf1 and conf2:
+    all_extra_cols = conf1['extra_cols'] + conf2['extra_cols']
+    st.subheader("Optional: Credit column")
+    credit_choice = st.selectbox(
+        "Add a 'Credit' column = negative of which column?",
+        ['(none)'] + all_extra_cols
+    )
+    credit_source = None if credit_choice == '(none)' else credit_choice
+
+    st.subheader("Optional: Rename output headers")
+    raw_headers_preview = ['Key'] + all_extra_cols + (['Credit'] if credit_source else [])
+    rename_cols = st.columns(min(4, len(raw_headers_preview)))
+    for i, h in enumerate(raw_headers_preview):
+        with rename_cols[i % len(rename_cols)]:
+            new_name = st.text_input(f"'{h}' displays as", value=h, key=f"rename_{i}_{h}")
+            if new_name != h:
+                display_names[h] = new_name
+
+    add_filters = st.checkbox("Add filter dropdown arrows to header row", value=True)
+
+    run = st.button("Run mapping", type="primary")
+
+    if run:
+        with st.spinner("Mapping..."):
+            data1, unmatched_extract_1 = index_by_key(
+                conf1['ws'], header_map(conf1['ws'], conf1['header_row']),
+                conf1['key_header'], conf1['extra_cols'], conf1['extractor'],
+                conf1['header_row'], conf1['keep_all_rows']
+            )
+            data2, unmatched_extract_2 = index_by_key(
+                conf2['ws'], header_map(conf2['ws'], conf2['header_row']),
+                conf2['key_header'], conf2['extra_cols'], conf2['extractor'],
+                conf2['header_row'], conf2['keep_all_rows']
+            )
+
+            keys1, keys2 = set(data1), set(data2)
+            matched_keys = sorted(keys1 & keys2)
+            only_in_1 = sorted(keys1 - keys2)
+            only_in_2 = sorted(keys2 - keys1)
+
+            wb_out = openpyxl.Workbook()
+            ws_out = wb_out.active
+            ws_out.title = 'Mapped'
+
+            raw_headers = ['Key'] + conf1['extra_cols'] + conf2['extra_cols']
+            credit_idx_1 = conf1['extra_cols'].index(credit_source) if credit_source in conf1['extra_cols'] else None
+            credit_idx_2 = conf2['extra_cols'].index(credit_source) if credit_source in conf2['extra_cols'] else None
+            if credit_source:
+                raw_headers = raw_headers + ['Credit']
+
+            display_headers = [display_names.get(h, h) for h in raw_headers]
+            ws_out.append(display_headers)
+
+            output_row_count = 0
+            for key in matched_keys:
+                for sub2 in data2[key]:              # usually len 1 unless keep_all_rows checked
+                    vals2 = sub2['values']
+                    for sub1 in data1[key]:
+                        vals1 = sub1['values']
+                        row = [key] + vals1 + vals2
+                        if credit_source:
+                            src_val = vals1[credit_idx_1] if credit_idx_1 is not None else vals2[credit_idx_2]
+                            row.append(negate(src_val))
+                        ws_out.append(row)
+                        output_row_count += 1
+
+            if add_filters:
+                last_col_letter = ws_out.cell(row=1, column=len(raw_headers)).column_letter
+                ws_out.auto_filter.ref = f"A1:{last_col_letter}{ws_out.max_row}"
+
+            ws_unmatched = wb_out.create_sheet('Unmatched')
+            ws_unmatched.append(['Reason', 'Source File', 'Raw Value', 'Extracted Key'])
+            for key in only_in_1:
+                for sub in data1[key]:
+                    ws_unmatched.append(['No match in File2', 'File1', sub['raw'], key])
+            for key in only_in_2:
+                for sub in data2[key]:
+                    ws_unmatched.append(['No match in File1', 'File2', sub['raw'], key])
+            for raw_val in unmatched_extract_1:
+                ws_unmatched.append(['Could not extract key', 'File1', raw_val, None])
+            for raw_val in unmatched_extract_2:
+                ws_unmatched.append(['Could not extract key', 'File2', raw_val, None])
+
+            buffer = io.BytesIO()
+            wb_out.save(buffer)
+            buffer.seek(0)
+
+        st.success(f"Done. Matched keys: {len(matched_keys)} | Output rows: {output_row_count} | "
+                   f"Unmatched File1-only: {len(only_in_1)} | Unmatched File2-only: {len(only_in_2)}")
+
+        st.download_button(
+            "Download mapped_output.xlsx",
+            data=buffer,
+            file_name="mapped_output.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+else:
+    st.info("Upload both files above to configure the mapping.")
