@@ -244,8 +244,10 @@ def apply_stacking(rows, header_order, stack_configs):
     Returns (new_rows, new_header_order). Each source column in "columns"
     is removed from the header order and replaced by output_header (and
     label_header, if given) at the position of the first source column.
-    Every row is duplicated once per column in the group - all other
-    values on that row are repeated unchanged.
+
+    Rows are grouped by source column, in the order given in "columns" -
+    i.e. ALL rows for the first column appear first, then ALL rows for the
+    second column, and so on (not interleaved row-by-row).
     """
     if not stack_configs:
         return rows, header_order
@@ -261,28 +263,27 @@ def apply_stacking(rows, header_order, stack_configs):
             insert_block.append(cfg["label_header"])
         new_header_order[insert_at:insert_at] = insert_block
 
-    new_rows = []
-    for row in rows:
-        expanded = [dict(row)]
-        for cfg in stack_configs:
-            cols = cfg["columns"]
-            output_header = cfg["output_header"]
-            label_header = cfg.get("label_header")
-            skip_blank = cfg.get("skip_blank", False)
-            next_expanded = []
-            for r in expanded:
-                for col in cols:
-                    val = r.get(col)
-                    if skip_blank and (val is None or str(val).strip() == ''):
-                        continue
-                    new_r = {k: v for k, v in r.items() if k not in cols}
-                    new_r[output_header] = val
-                    if label_header:
-                        new_r[label_header] = col
-                    next_expanded.append(new_r)
-            expanded = next_expanded
-        new_rows.extend(expanded)
-    return new_rows, new_header_order
+    current_rows = rows
+    for cfg in stack_configs:
+        cols = cfg["columns"]
+        output_header = cfg["output_header"]
+        label_header = cfg.get("label_header")
+        skip_blank = cfg.get("skip_blank", False)
+
+        grouped_rows = []
+        for col in cols:                # outer loop: one full pass per source column
+            for r in current_rows:      # inner loop: every row, in original order
+                val = r.get(col)
+                if skip_blank and (val is None or str(val).strip() == ''):
+                    continue
+                new_r = {k: v for k, v in r.items() if k not in cols}
+                new_r[output_header] = val
+                if label_header:
+                    new_r[label_header] = col
+                grouped_rows.append(new_r)
+        current_rows = grouped_rows
+
+    return current_rows, new_header_order
 
 
 # ==================== MAIN ====================
