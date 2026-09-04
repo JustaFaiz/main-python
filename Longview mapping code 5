@@ -158,27 +158,41 @@ def build_column_plan(extra_cols, merge_columns):
     return output_headers, col_specs
 
 
-def resolve_row_value(ws, headers, row, col_spec):
+def resolve_single_value(ws, headers, row, col_name, computed):
+    """
+    Resolves one column name to its value for this row. Checks "computed"
+    first (values already worked out earlier in this same row - e.g. an
+    earlier merge's output_header), then falls back to the sheet's real
+    header row. This is what lets a later merge reference an earlier
+    merge's output_header as one of its own source_columns.
+    """
+    if computed is not None and col_name in computed:
+        return computed[col_name]
+    col_num = headers[col_name]
+    return ws.cell(row=row, column=col_num).value
+
+
+def resolve_row_value(ws, headers, row, col_spec, computed=None):
     """
     col_spec is either a plain column-name string, or a tuple of column
     names to coalesce (first non-blank value among them wins). "Blank"
     means None OR an empty/whitespace-only string, since exported
     formula cells (e.g. Longview/SAP) often show blank but actually
-    contain "" rather than a true empty cell.
+    contain "" rather than a true empty cell. Each name in col_spec may
+    refer to a real sheet column OR an earlier merge's output_header -
+    see resolve_single_value.
     """
     if isinstance(col_spec, tuple):
         for col_name in col_spec:
-            col_num = headers[col_name]
-            val = ws.cell(row=row, column=col_num).value
+            val = resolve_single_value(ws, headers, row, col_name, computed)
             if val is not None and str(val).strip() != '':
                 return val
         return None
     else:
-        col_num = headers[col_spec]
-        return ws.cell(row=row, column=col_num).value
+        return resolve_single_value(ws, headers, row, col_spec, computed)
 
 
-def index_by_key(ws, headers, key_header, col_specs, key_extractor, header_row, keep_all_rows):
+def index_by_key(ws, headers, key_header, output_headers, col_specs, key_extractor, header_row, keep_all_rows):
     data = {}
     unmatched_raw = []
     key_col = headers[key_header]
@@ -190,9 +204,15 @@ def index_by_key(ws, headers, key_header, col_specs, key_extractor, header_row, 
         if key is None:
             unmatched_raw.append(raw_val)
             continue
+        row_values = []
+        computed = {}
+        for out_name, spec in zip(output_headers, col_specs):
+            val = resolve_row_value(ws, headers, row, spec, computed)
+            computed[out_name] = val
+            row_values.append(val)
         entry = {
             'raw': raw_val,
-            'values': [resolve_row_value(ws, headers, row, spec) for spec in col_specs],
+            'values': row_values,
         }
         if keep_all_rows:
             data.setdefault(key, []).append(entry)
@@ -302,11 +322,11 @@ def main():
     file2_output_headers, file2_col_specs = build_column_plan(FILE2_EXTRA_COLS, FILE2_MERGE_COLUMNS)
 
     data1, unmatched_extract_1 = index_by_key(
-        ws1, headers1, FILE1_KEY_HEADER, file1_col_specs, extractor1,
+        ws1, headers1, FILE1_KEY_HEADER, file1_output_headers, file1_col_specs, extractor1,
         FILE1_HEADER_ROW, FILE1_KEEP_ALL_ROWS
     )
     data2, unmatched_extract_2 = index_by_key(
-        ws2, headers2, FILE2_KEY_HEADER, file2_col_specs, extractor2,
+        ws2, headers2, FILE2_KEY_HEADER, file2_output_headers, file2_col_specs, extractor2,
         FILE2_HEADER_ROW, FILE2_KEEP_ALL_ROWS
     )
 
