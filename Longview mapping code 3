@@ -1,0 +1,315 @@
+"""
+Excel Key Mapper - Script Version
+========================================
+Matches rows between two Excel files on a "key" column, pulls chosen columns
+from each into one merged output sheet, and lists unmatched rows separately.
+
+Also supports "merging" (coalescing) pairs of source columns that take turns
+being populated - e.g. Column A has values for rows 1-10 and is blank
+after that, Column B is blank for rows 1-10 and has values from row 11
+onward. Merging them produces a single continuous output column.
+
+No dashboard/UI - just edit the CONFIG section below and run:
+
+    pip install openpyxl
+    python excel_key_mapper.py
+"""
+
+import re
+import openpyxl
+
+
+# ==================== CONFIG - EDIT THIS SECTION ====================
+
+FILE1_PATH = "file1.xlsx"
+FILE1_SHEET = None          # None = active/first sheet, or e.g. "Sheet1"
+FILE1_HEADER_ROW = 1        # row number containing the column names
+FILE1_KEY_HEADER = "Key"    # column used for matching
+FILE1_EXTRACTOR = "as_is"   # "as_is", "split_dash", or "us_digits"
+FILE1_EXTRA_COLS = []       # plain extra columns to pull into the output, e.g. ["Amount", "Description"]
+FILE1_KEEP_ALL_ROWS = False # True = keep every row sharing a key, False = collapse to one
+FILE1_SHOW_RAW = False      # True = also output the original (pre-cleanup) key value
+
+# Column pairs to merge/coalesce into ONE output column. For each row, the
+# first non-empty value among the listed source columns (in order) is used.
+# Add one dict per pair you want merged - can be more than one pair.
+FILE1_MERGE_COLUMNS = [
+    # {"source_columns": ["Jan-Oct Total", "Nov-Dec Total"], "output_header": "Full Year Total"},
+]
+
+FILE2_PATH = "file2.xlsx"
+FILE2_SHEET = None
+FILE2_HEADER_ROW = 1
+FILE2_KEY_HEADER = "Key"
+FILE2_EXTRACTOR = "as_is"
+FILE2_EXTRA_COLS = []
+FILE2_KEEP_ALL_ROWS = False
+FILE2_SHOW_RAW = False
+
+FILE2_MERGE_COLUMNS = [
+    # {"source_columns": ["H1 Amount", "H2 Amount"], "output_header": "Full Year Amount"},
+]
+
+# Optional: add a "Credit" column derived from one of the extra/merged columns
+# above. Set CREDIT_SOURCE_COLUMN to None to skip, or to the exact output
+# header name (must be one of FILE1_EXTRA_COLS / FILE1_MERGE_COLUMNS'
+# output_header / FILE2_EXTRA_COLS / FILE2_MERGE_COLUMNS' output_header).
+CREDIT_SOURCE_COLUMN = None
+
+# How to turn the source column into the Credit value:
+#   "negate"              -> Credit = -source_value                (old behavior)
+#   "multiply_then_negate" -> Credit = -(source_value * CREDIT_MULTIPLIER)
+CREDIT_MODE = "negate"
+CREDIT_MULTIPLIER = 0.21   # only used when CREDIT_MODE = "multiply_then_negate" (e.g. 0.21 for 21% US tax)
+
+# When CREDIT_MODE = "multiply_then_negate", also show the intermediate
+# multiplied value (before negating) as its own column, so both the
+# 21%-of-source figure and the final negative Credit are visible.
+SHOW_MULTIPLIED_COLUMN = True
+MULTIPLIED_COLUMN_HEADER = "US Tax"
+
+# Optional: rename output headers. Keys are the raw header names ("Key",
+# "File1 Original Value", your extra/merged column names, "Credit"); values
+# are what you want them displayed as. Leave empty to keep raw names.
+DISPLAY_NAME_OVERRIDES = {
+    # "Key": "Matching ID",
+}
+
+# Add filter dropdown arrows to the header row of the output sheet
+ADD_FILTERS = True
+
+OUTPUT_PATH = "mapped_output.xlsx"
+
+# ==================== END CONFIG ====================
+
+
+# ==================== CORE LOGIC ====================
+
+def header_map(ws, header_row):
+    result = {}
+    for cell in ws[header_row]:
+        if cell.value is not None:
+            clean = str(cell.value).replace('\xa0', ' ').strip()
+            clean = re.sub(r'\s+', ' ', clean)
+            result[clean] = cell.column
+    return result
+
+
+def extract_identity(value):
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    return cleaned if cleaned else None
+
+
+def extract_split_dash(value):
+    """'US0110010 - LVL4 ...' -> 'US0110010'"""
+    if value is None:
+        return None
+    return str(value).split(' - ')[0].strip()
+
+
+def extract_us_digits(value):
+    """'US 1100010J' -> 'US1100010'"""
+    if value is None:
+        return None
+    cleaned = str(value).replace(' ', '')
+    match = re.match(r'^(US\d+)', cleaned)
+    return match.group(1) if match else None
+
+
+EXTRACTORS = {
+    "as_is": extract_identity,
+    "split_dash": extract_split_dash,
+    "us_digits": extract_us_digits,
+}
+
+
+def build_column_plan(extra_cols, merge_columns):
+    """
+    Combines plain extra columns and merge-column specs into two parallel
+    lists: the output header name for each resulting column, and the
+    "spec" used to pull each row's value (a plain column name, or a tuple
+    of column names to coalesce).
+    """
+    output_headers = list(extra_cols)
+    col_specs = list(extra_cols)
+    for merge in merge_columns:
+        output_headers.append(merge["output_header"])
+        col_specs.append(tuple(merge["source_columns"]))
+    return output_headers, col_specs
+
+
+def resolve_row_value(ws, headers, row, col_spec):
+    """
+    col_spec is either a plain column-name string, or a tuple of column
+    names to coalesce (first non-None value among them wins).
+    """
+    if isinstance(col_spec, tuple):
+        for col_name in col_spec:
+            col_num = headers[col_name]
+            val = ws.cell(row=row, column=col_num).value
+            if val is not None:
+                return val
+        return None
+    else:
+        col_num = headers[col_spec]
+        return ws.cell(row=row, column=col_num).value
+
+
+def index_by_key(ws, headers, key_header, col_specs, key_extractor, header_row, keep_all_rows):
+    data = {}
+    unmatched_raw = []
+    key_col = headers[key_header]
+    for row in range(header_row + 1, ws.max_row + 1):
+        raw_val = ws.cell(row=row, column=key_col).value
+        if raw_val is None:
+            continue
+        key = key_extractor(raw_val)
+        if key is None:
+            unmatched_raw.append(raw_val)
+            continue
+        entry = {
+            'raw': raw_val,
+            'values': [resolve_row_value(ws, headers, row, spec) for spec in col_specs],
+        }
+        if keep_all_rows:
+            data.setdefault(key, []).append(entry)
+        else:
+            data[key] = [entry]   # always store as list internally for uniform handling
+    return data, unmatched_raw
+
+
+def negate(value):
+    if value is None:
+        return None
+    try:
+        return -value
+    except TypeError:
+        return None
+
+
+def multiply(value, multiplier):
+    if value is None:
+        return None
+    try:
+        return value * multiplier
+    except TypeError:
+        return None
+
+
+def load_sheet(path, sheet_name):
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb[sheet_name] if sheet_name else wb.active
+    return wb, ws
+
+
+def resolve_extractor(name):
+    if name not in EXTRACTORS:
+        raise ValueError(f"Unknown extractor '{name}'. Choose from: {list(EXTRACTORS)}")
+    return EXTRACTORS[name]
+
+
+# ==================== MAIN ====================
+
+def main():
+    wb1, ws1 = load_sheet(FILE1_PATH, FILE1_SHEET)
+    wb2, ws2 = load_sheet(FILE2_PATH, FILE2_SHEET)
+
+    headers1 = header_map(ws1, FILE1_HEADER_ROW)
+    headers2 = header_map(ws2, FILE2_HEADER_ROW)
+
+    extractor1 = resolve_extractor(FILE1_EXTRACTOR)
+    extractor2 = resolve_extractor(FILE2_EXTRACTOR)
+
+    file1_output_headers, file1_col_specs = build_column_plan(FILE1_EXTRA_COLS, FILE1_MERGE_COLUMNS)
+    file2_output_headers, file2_col_specs = build_column_plan(FILE2_EXTRA_COLS, FILE2_MERGE_COLUMNS)
+
+    data1, unmatched_extract_1 = index_by_key(
+        ws1, headers1, FILE1_KEY_HEADER, file1_col_specs, extractor1,
+        FILE1_HEADER_ROW, FILE1_KEEP_ALL_ROWS
+    )
+    data2, unmatched_extract_2 = index_by_key(
+        ws2, headers2, FILE2_KEY_HEADER, file2_col_specs, extractor2,
+        FILE2_HEADER_ROW, FILE2_KEEP_ALL_ROWS
+    )
+
+    keys1, keys2 = set(data1), set(data2)
+    matched_keys = sorted(keys1 & keys2)
+    only_in_1 = sorted(keys1 - keys2)
+    only_in_2 = sorted(keys2 - keys1)
+
+    wb_out = openpyxl.Workbook()
+    ws_out = wb_out.active
+    ws_out.title = 'Mapped'
+
+    raw_headers = ['Key']
+    if FILE1_SHOW_RAW:
+        raw_headers += ['File1 Original Value']
+    raw_headers += file1_output_headers
+    if FILE2_SHOW_RAW:
+        raw_headers += ['File2 Original Value']
+    raw_headers += file2_output_headers
+
+    credit_idx_1 = file1_output_headers.index(CREDIT_SOURCE_COLUMN) if CREDIT_SOURCE_COLUMN in file1_output_headers else None
+    credit_idx_2 = file2_output_headers.index(CREDIT_SOURCE_COLUMN) if CREDIT_SOURCE_COLUMN in file2_output_headers else None
+    show_multiplied_col = CREDIT_SOURCE_COLUMN and CREDIT_MODE == "multiply_then_negate" and SHOW_MULTIPLIED_COLUMN
+    if show_multiplied_col:
+        raw_headers = raw_headers + [MULTIPLIED_COLUMN_HEADER]
+    if CREDIT_SOURCE_COLUMN:
+        raw_headers = raw_headers + ['Credit']
+
+    display_headers = [DISPLAY_NAME_OVERRIDES.get(h, h) for h in raw_headers]
+    ws_out.append(display_headers)
+
+    output_row_count = 0
+    for key in matched_keys:
+        for sub2 in data2[key]:              # usually len 1 unless keep_all_rows is True
+            vals2 = sub2['values']
+            for sub1 in data1[key]:
+                vals1 = sub1['values']
+                row = [key]
+                if FILE1_SHOW_RAW:
+                    row.append(sub1['raw'])
+                row += vals1
+                if FILE2_SHOW_RAW:
+                    row.append(sub2['raw'])
+                row += vals2
+                if CREDIT_SOURCE_COLUMN:
+                    src_val = vals1[credit_idx_1] if credit_idx_1 is not None else vals2[credit_idx_2]
+                    if CREDIT_MODE == "multiply_then_negate":
+                        multiplied_val = multiply(src_val, CREDIT_MULTIPLIER)
+                        if show_multiplied_col:
+                            row.append(multiplied_val)
+                        row.append(negate(multiplied_val))
+                    else:  # "negate"
+                        row.append(negate(src_val))
+                ws_out.append(row)
+                output_row_count += 1
+
+    if ADD_FILTERS:
+        last_col_letter = ws_out.cell(row=1, column=len(raw_headers)).column_letter
+        ws_out.auto_filter.ref = f"A1:{last_col_letter}{ws_out.max_row}"
+
+    ws_unmatched = wb_out.create_sheet('Unmatched')
+    ws_unmatched.append(['Reason', 'Source File', 'Raw Value', 'Extracted Key'])
+    for key in only_in_1:
+        for sub in data1[key]:
+            ws_unmatched.append(['No match in File2', 'File1', sub['raw'], key])
+    for key in only_in_2:
+        for sub in data2[key]:
+            ws_unmatched.append(['No match in File1', 'File2', sub['raw'], key])
+    for raw_val in unmatched_extract_1:
+        ws_unmatched.append(['Could not extract key', 'File1', raw_val, None])
+    for raw_val in unmatched_extract_2:
+        ws_unmatched.append(['Could not extract key', 'File2', raw_val, None])
+
+    wb_out.save(OUTPUT_PATH)
+
+    print(f"Done. Matched keys: {len(matched_keys)} | Output rows: {output_row_count}")
+    print(f"Unmatched File1-only: {len(only_in_1)} | Unmatched File2-only: {len(only_in_2)}")
+    print(f"Saved to: {OUTPUT_PATH}")
+
+
+if __name__ == "__main__":
+    main()
